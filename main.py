@@ -126,10 +126,9 @@ async def chat_endpoint(req: ChatRequest):
                 conn.close()
 
         # ---------------------------------------------------------
-        # 2. アナリストモード（勝敗予想・対戦成績） ★ここに追加！
+        # 2. アナリストモード（勝敗予想・対戦成績）
         # ---------------------------------------------------------
         elif "予想" in user_query or "対戦" in user_query or "相性" in user_query or "vs" in user_query.lower():
-            # Step A: 質問に含まれる選手名を特定する
             extract_prompt = f"""
             ユーザーの質問から、分析対象となる「選手名」を全て抽出してください。
             質問: "{user_query}"
@@ -147,12 +146,12 @@ async def chat_endpoint(req: ChatRequest):
 
             conn = get_connection()
             try:
-                # Step B: 各選手の「通算スタッツ」を取得
+                # 通算スタッツ取得
                 placeholders = ",".join(["?"] * len(target_names))
                 sql_stats = f"SELECT * FROM stats WHERE player IN ({placeholders})"
                 df_stats = pd.read_sql_query(sql_stats, conn, params=target_names)
                 
-                # Step C: 各選手の「直近5試合」を取得（調子を見るため）
+                # 直近5試合取得
                 recent_data_text = ""
                 for p in target_names:
                     sql_recent = "SELECT date, rank, point FROM games WHERE player = ? ORDER BY date DESC LIMIT 5"
@@ -160,7 +159,6 @@ async def chat_endpoint(req: ChatRequest):
                     if not df_recent.empty:
                         recent_data_text += f"\n【{p}の直近5戦】\n{df_recent.to_string(index=False)}\n"
 
-                # Step D: アナリストAIに分析させる
                 final_prompt = f"""
                 あなたはMリーグのプロアナリストです。
                 ユーザーの質問: "{user_query}"
@@ -174,8 +172,7 @@ async def chat_endpoint(req: ChatRequest):
                 {recent_data_text}
                 
                 【指示】
-                - 「勝敗予想」の場合は、スタッツ（平均着順やポイント）と直近の勢いを総合して、最も勝率が高そうな選手を1名挙げ、理由を解説してください。
-                - 「対戦成績・相性」の場合は、それぞれのデータの強み（攻撃型か守備型かなど）を比較してください。
+                - 「勝敗予想」の場合は、スタッツと勢いを総合して、最も勝率が高そうな選手を1名挙げ、理由を解説してください。
                 - 最後に必ず「※データに基づく予想であり、結果を保証するものではありません」と注釈を入れてください。
                 """
                 res_final = openai.chat.completions.create(
@@ -225,7 +222,17 @@ async def chat_endpoint(req: ChatRequest):
         あなたはMリーグのデータエンジニアです。
         質問「{user_query}」に対し、適切なSQLを作成してください。
         【正しい名前】選手: {player_vocab} チーム: {team_vocab}
-        【指示】ユーザー入力を上記リストの名前に変換し、LIKE検索してください。
+        
+        【重要】
+        - DB内の名前に「スペース」は含まれません（例: '伊達朱里紗'）。
+        - 検索時は必ず LIKE '%キーワード%' を使ってください。
+        - '伊達 朱里紗' のようなスペース入りは禁止です。
+        
+        テーブル:
+        1. stats (通算): player, team, points, matches...
+        2. games (日別): date, rank, player, point
+        3. team_ranking (順位): rank, team, point
+        
         回答はSQLのみ。
         """
         res_sql = openai.chat.completions.create(
