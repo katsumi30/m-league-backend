@@ -10,8 +10,13 @@ import os
 # ==========================================
 # ★ APIキー設定 (本番用安全仕様) ★
 # ==========================================
-# サーバー(Render)の設定画面にある "OPENAI_API_KEY" を読み込みます
 openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# ローカルテスト用（GitHubに上げる時は削除するか、空にしておいてください）
+if not openai.api_key:
+    # 自分のキーを入れてテストする時はここを書き換える
+    # openai.api_key = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    pass
 
 app = FastAPI()
 app.add_middleware(
@@ -20,22 +25,37 @@ app.add_middleware(
 
 DB_NAME = 'm_league.db'
 
-# 辞書読み込み
+# 辞書読み込み（ログ表示機能付き）
 def get_db_vocabulary():
+    print("--- データベース読込開始 ---") # ★追加
     try:
         conn = sqlite3.connect(DB_NAME)
         cur = conn.cursor()
+        
+        # チーム名
         cur.execute("SELECT DISTINCT team FROM stats")
         teams = [r[0] for r in cur.fetchall() if r[0]]
+        
+        # 選手名
         cur.execute("SELECT DISTINCT player FROM stats")
         players = [r[0] for r in cur.fetchall() if r[0]]
+        
         conn.close()
-        # ログには出すが、本番環境のログは見えないことが多いのでエラー時のみ注意
+        
+        # ★ここでログに出力！
+        print(f"✅ チーム読み込み: {len(teams)} チーム")
+        print(f"   {teams}") 
+        print(f"✅ 選手読み込み: {len(players)} 名")
+        print(f"   {players[:5]}...") # 最初5人だけ表示
+        
         return ", ".join(teams), ", ".join(players)
-    except:
+    except Exception as e:
+        print(f"❌ 読み込みエラー: {e}")
         return "", ""
 
+# サーバー起動時に実行
 TEAM_VOCAB, PLAYER_VOCAB = get_db_vocabulary()
+print("--- データベース読込完了 ---") # ★追加
 
 class ChatRequest(BaseModel):
     message: str
@@ -43,7 +63,6 @@ class ChatRequest(BaseModel):
 @app.post("/chat")
 async def chat_endpoint(req: ChatRequest):
     try:
-        # もしAPIキーが設定されていなければエラーを返す（安全装置）
         if not openai.api_key:
             return {"reply": "【エラー】APIキーが設定されていません。RenderのEnvironment Variablesに 'OPENAI_API_KEY' を設定してください。", "graph": None}
 
