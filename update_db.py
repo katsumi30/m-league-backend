@@ -17,16 +17,12 @@ def get_soup(url):
         print(f"エラー: {e}")
         return None
 
-# -------------------------------------------------------
-# 1. チーム順位 (points)
-# -------------------------------------------------------
+# 1. チーム順位
 def scrape_points(conn):
     soup = get_soup("https://m-league.jp/points/")
     if not soup: return
-
     data = []
     rows = soup.find_all('tr')
-    
     for row in rows:
         try:
             rank_elem = row.find(class_=re.compile('ranking-no'))
@@ -36,23 +32,17 @@ def scrape_points(conn):
                     try:
                         rank = int(cols[0].get_text(strip=True))
                         name = cols[1].get_text(strip=True)
-                        point_str = cols[2].get_text(strip=True)
-                        point = float(point_str.replace('pt', '').replace('▲', '-').replace(',', ''))
+                        point = float(cols[2].get_text(strip=True).replace('pt', '').replace('▲', '-').replace(',', ''))
                         data.append({"rank": rank, "team": name, "point": point})
                         continue
-                    except:
-                        pass
-
+                    except: pass
             rank = row.find(class_=re.compile('rank-number')).get_text(strip=True)
             name = row.find(class_='team-name').get_text(strip=True)
-            point = row.find(class_='point').get_text(strip=True)
-            point = float(point.replace('pt', '').replace('▲', '-').replace(',', ''))
+            point = float(row.find(class_='point').get_text(strip=True).replace('pt', '').replace('▲', '-').replace(',', ''))
             data.append({"rank": int(rank), "team": name, "point": point})
-        except:
-            continue
-            
-    if not data:
-        print("  pointsページ失敗。トップページから再試行...")
+        except: continue
+    
+    if not data: # バックアップ
         soup_top = get_soup("https://m-league.jp/")
         if soup_top:
             teams = soup_top.find_all('div', class_='p-ranking__team-item')
@@ -60,42 +50,30 @@ def scrape_points(conn):
                 try:
                     rank = team.find(class_=re.compile('p-ranking__rank-number')).get_text(strip=True)
                     name = team.find(class_='p-ranking__team-name').get_text(strip=True)
-                    point = team.find(class_='p-ranking__current-point').get_text(strip=True)
-                    point = float(point.replace('pt', '').replace('▲', '-').replace(',', ''))
+                    point = float(team.find(class_='p-ranking__current-point').get_text(strip=True).replace('pt', '').replace('▲', '-').replace(',', ''))
                     data.append({"rank": int(rank), "team": name, "point": point})
-                except:
-                    continue
+                except: continue
 
     if data:
         df = pd.DataFrame(data)
         df.to_sql('team_ranking', conn, if_exists='replace', index=False)
-        print(f"✅ チーム順位: {len(df)} チーム保存完了")
-    else:
-        print("❌ チーム順位の取得に失敗しました。")
+        print(f"✅ チーム順位: {len(df)} チーム")
 
-# -------------------------------------------------------
-# 2. 試合結果 (games) - ★日付のゼロ埋め修正を追加！
-# -------------------------------------------------------
+# 2. 試合結果 (日付修正版)
 def scrape_games(conn):
     soup = get_soup("https://m-league.jp/games/")
     if not soup: return
-
     data = []
     modals = soup.find_all('div', class_='c-modal2')
     
     for modal in modals:
         try:
-            # 日付テキストを取得 (例: "9/30(火)")
             date_text = modal.find('div', class_='p-gamesResult__date').get_text(strip=True)
-            
-            # ★ここを修正: "9/30" -> "09/30" に変換して保存する
-            month_day = date_text.split('(')[0] # "9/30"
+            # "9/30" -> "09/30" に変換
+            month_day = date_text.split('(')[0]
             parts = month_day.split('/')
             if len(parts) == 2:
-                month = int(parts[0])
-                day = int(parts[1])
-                # {:02d} で2桁ゼロ埋めにする (9->09)
-                date_str = f"2025/{month:02d}/{day:02d}" 
+                date_str = f"2025/{int(parts[0]):02d}/{int(parts[1]):02d}"
             else:
                 date_str = f"2025/{month_day}"
 
@@ -105,29 +83,23 @@ def scrape_games(conn):
                 rank_items = col.find_all('div', class_='p-gamesResult__rank-item')
                 for item in rank_items:
                     rank = item.find('div', class_='p-gamesResult__rank-badge').get_text(strip=True)
-                    player = item.find('div', class_='p-gamesResult__name').get_text(strip=True)
-                    player = player.replace(" ", "").replace("　", "")
-                    point_text = item.find('div', class_='p-gamesResult__point').get_text(strip=True)
-                    point = float(point_text.replace('pt', '').replace('▲', '-').replace(',', ''))
+                    player = item.find('div', class_='p-gamesResult__name').get_text(strip=True).replace(" ", "").replace("　", "")
+                    point = float(item.find('div', class_='p-gamesResult__point').get_text(strip=True).replace('pt', '').replace('▲', '-').replace(',', ''))
                     data.append({"date": date_str, "game_count": game_num, "rank": int(rank), "player": player, "point": point})
-        except:
-            continue
+        except: continue
 
     if data:
         df = pd.DataFrame(data)
         df.to_sql('games', conn, if_exists='replace', index=False)
-        print(f"✅ 試合結果: {len(df)} 件保存完了")
+        print(f"✅ 試合結果: {len(df)} 件")
+        print(f"   (最新の日付サンプル: {df['date'].max()})") # ←これが 2025/11/xx になっていれば成功！
 
-# -------------------------------------------------------
-# 3. 個人成績 (stats)
-# -------------------------------------------------------
+# 3. 個人成績
 def scrape_stats(conn):
     soup = get_soup("https://m-league.jp/stats/")
     if not soup: return
-
     data_list = []
     sections = soup.find_all('section', class_='p-stats__team')
-
     for section in sections:
         try:
             team_name = section.find('h2', class_='p-stats__teamName').get_text(strip=True)
@@ -136,15 +108,7 @@ def scrape_stats(conn):
             rows = table.find_all('tr')
             players = [p.get_text(strip=True).replace(" ", "").replace("　", "") for p in rows[0].find_all('th')[1:]]
             player_stats = {p: {'team': team_name, 'player': p} for p in players}
-            
-            key_map = {
-                '試合数': 'matches', '総局数': 'total_hands', 'ポイント': 'points', '平着': 'avg_rank',
-                '1位': 'rank_1_count', '2位': 'rank_2_count', '3位': 'rank_3_count', '4位': 'rank_4_count',
-                'トップ率': 'top_rate', '連対率': 'rentai_rate', 'ラス回避率': 'last_avoid_rate',
-                'ベストスコア': 'best_score', '平均打点': 'avg_score', '副露率': 'furo_rate',
-                'リーチ率': 'riichi_rate', 'アガリ率': 'agari_rate', '放銃率': 'hoju_rate',
-                '放銃平均打点': 'hoju_avg_score'
-            }
+            key_map = {'試合数': 'matches', '総局数': 'total_hands', 'ポイント': 'points', '平着': 'avg_rank', '1位': 'rank_1_count', '2位': 'rank_2_count', '3位': 'rank_3_count', '4位': 'rank_4_count', 'トップ率': 'top_rate', '連対率': 'rentai_rate', 'ラス回避率': 'last_avoid_rate', 'ベストスコア': 'best_score', '平均打点': 'avg_score', '副露率': 'furo_rate', 'リーチ率': 'riichi_rate', 'アガリ率': 'agari_rate', '放銃率': 'hoju_rate', '放銃平均打点': 'hoju_avg_score'}
             for row in rows[1:]:
                 header = row.find('th').get_text(strip=True)
                 if header in key_map:
@@ -157,19 +121,17 @@ def scrape_stats(conn):
                             except: pass
                             player_stats[players[i]][db_key] = val
             data_list.extend(player_stats.values())
-        except:
-            continue
-
+        except: continue
     if data_list:
         df = pd.DataFrame(data_list)
         df.to_sql('stats', conn, if_exists='replace', index=False)
-        print(f"✅ 個人スタッツ: {len(df)} 名分保存完了")
+        print(f"✅ 個人スタッツ: {len(df)} 名")
 
 if __name__ == "__main__":
     conn = sqlite3.connect(DB_NAME)
-    print("--- データ更新開始 (日付ゼロ埋め版) ---")
+    print("--- 新規データ作成中 ---")
     scrape_points(conn)
     scrape_games(conn)
     scrape_stats(conn)
     conn.close()
-    print("--- データ更新完了 ---")
+    print("--- 完了 ---")
