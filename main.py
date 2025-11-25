@@ -11,6 +11,10 @@ import os
 # ★ APIキー設定 ★
 # ==========================================
 openai.api_key = os.getenv("OPENAI_API_KEY")
+# ローカルテスト用（GitHubに上げる時は削除推奨）
+if not openai.api_key:
+    openai.api_key = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
@@ -47,14 +51,20 @@ async def chat_endpoint(req: ChatRequest):
         # 1. グラフ生成モード
         # =========================================================
         if "推移" in user_query or "グラフ" in user_query:
-            # ... (グラフ機能は変更なし) ...
             id_prompt = f"""
             ユーザーは「ポイント推移」を知りたがっています。
             質問: "{user_query}"
-            【DB内の正しい名称】チーム: {TEAM_VOCAB} 選手: {PLAYER_VOCAB}
-            【指示】質問対象を特定し、LIKE検索を使ったSQLを作成してください。
+            
+            【DB内の正しい名称リスト】
+            チーム: {TEAM_VOCAB}
+            選手: {PLAYER_VOCAB}
+            
+            【指示】
+            質問対象を特定し、LIKE検索を使ったSQLを作成してください。
+            
             パターンA（チーム）: SELECT date, point, player FROM games WHERE player IN (SELECT player FROM stats WHERE team LIKE '%キーワード%') ORDER BY date;
             パターンB（個人）: SELECT date, point, player FROM games WHERE player LIKE '%キーワード%' ORDER BY date;
+            
             回答はSQLのみ出力。
             """
             res = openai.chat.completions.create(
@@ -85,7 +95,7 @@ async def chat_endpoint(req: ChatRequest):
                     final_prompt = f"""
                     Mリーグ実況者として解説してください。
                     質問: {user_query}
-                    データ: {df_grouped.tail(5).to_string()}
+                    データ(直近): {df_grouped.tail(5).to_string()}
                     「グラフをご覧ください」と添えてください。
                     """
                     res_text = openai.chat.completions.create(
@@ -98,85 +108,54 @@ async def chat_endpoint(req: ChatRequest):
                 conn.close()
 
         # =========================================================
-        # 2. ★「最新の結果」「試合結果」特化モード（ここを追加！）
+        # 2. 最新結果モード
         # =========================================================
         elif "最新" in user_query or "試合結果" in user_query or "昨日の結果" in user_query:
             conn = sqlite3.connect(DB_NAME)
             try:
-                # (1) 直近の試合結果を取得（8レコード＝4人×2試合分 を目安に取得）
-                # 日付の新しい順、その中で第2試合→第1試合の順、さらに着順でソート
                 sql_games = "SELECT date, game_count, rank, player, point FROM games ORDER BY date DESC, game_count DESC, rank ASC LIMIT 8"
                 df_games = pd.read_sql_query(sql_games, conn)
-                
-                # (2) 現在のチーム順位を取得
                 sql_ranking = "SELECT rank, team, point FROM team_ranking ORDER BY rank"
                 df_ranking = pd.read_sql_query(sql_ranking, conn)
-                
-                # データを合体してAIに渡す
                 combined_data = f"【直近の試合結果(2試合分)】\n{df_games.to_string()}\n\n【現在のチーム順位】\n{df_ranking.to_string()}"
                 
-                print(f"最新結果モード実行:\n{combined_data}") # ログ確認用
-
                 final_prompt = f"""
                 あなたはMリーグの公式リポーターです。
-                ユーザーの質問「{user_query}」に対し、以下のデータを元に見やすく報告してください。
-                
-                【データ】
-                {combined_data}
-                
-                【出力のルール】
-                1. **「直近の試合結果」** と **「現在のチーム順位」** の2つのセクションに分けてください。
-                2. 試合結果は、日付ごとに「第1試合」「第2試合」を分けて、トップの選手だけでなく全順位(1位〜4位)を箇条書きで書いてください。
-                3. チーム順位は1位から順に書いてください。
-                4. 以下の絵文字を使ってリッチに表現してください。
-                   - 📅 (日付)
-                   - 🥇 🥈 🥉 4️⃣ (着順)
-                   - 🏆 (チーム順位)
-                5. 選手名とポイント、チーム名は **太字** にしてください。
-                
-                【出力例】
-                📅 **11月21日の試合結果**
-                
-                **第1回戦**
-                🥇 1位: **選手名** (+50.0)
-                🥈 2位: **選手名** (+10.0)
-                ...
-                
-                **第2回戦**
-                🥇 1位: **選手名** (+60.0)
-                ...
-                
-                🏆 **現在のチーム順位**
-                1. **チームA** (500.0pt)
-                2. **チームB** (300.0pt)
-                ...
+                質問「{user_query}」に対し、以下のデータを元に見やすく報告してください。
+                【データ】{combined_data}
+                【ルール】
+                - 「直近の試合結果」と「現在のチーム順位」に分ける。
+                - 絵文字(📅, 🥇, 🏆)を使用。
+                - 選手名、チーム名は太字(**)にする。
                 """
-                
                 res_final = openai.chat.completions.create(
                     model="gpt-4o", messages=[{"role": "system", "content": final_prompt}], temperature=0.3
                 )
                 return {"reply": res_final.choices[0].message.content, "graph": None}
-
             except Exception as e:
                 return {"reply": f"データ取得エラー: {e}", "graph": None}
             finally:
                 conn.close()
 
         # =========================================================
-        # 3. 通常モード（その他の質問）
+        # 3. 通常モード（★ここを修正！名前リストを追加）
         # =========================================================
         sql_prompt = f"""
         あなたはMリーグのデータエンジニアです。
         質問「{user_query}」に対し、適切なSQLを作成してください。
         
-        【テーブル定義】
-        1. stats (個人通算): player, team, points...
-        2. games (日別試合結果): date, game_count, rank, player, point
-        3. team_ranking (順位): rank, team, point
+        【重要：DB内の正しい名前リスト】
+        選手名: {PLAYER_VOCAB}
+        チーム名: {TEAM_VOCAB}
         
-        【ルール】
-        - 名前は LIKE '%キーワード%' で検索。
-        - 「順位」だけ聞かれたら team_ranking。
+        【指示】
+        ユーザーの入力（例:「茅森プロ」「タッキー」）を、上記リストにある正しい名前（例:「茅森早香」「滝沢和典」）に脳内変換して検索してください。
+        検索には必ず LIKE を使用してください（例: LIKE '%茅森%'）。
+        
+        【テーブル定義】
+        1. stats (個人通算): player, team, points, matches, riichi_rate(リーチ率), agari_rate(和了率), hoju_rate(放銃率)...
+        2. games (日別): date, game_count, rank, player, point
+        3. team_ranking (順位): rank, team, point
         
         回答はSQLのみ。
         """
@@ -184,7 +163,6 @@ async def chat_endpoint(req: ChatRequest):
             model="gpt-4o", messages=[{"role": "system", "content": sql_prompt}], temperature=0
         )
         gen_sql = res_sql.choices[0].message.content.strip().replace("```sql", "").replace("```", "")
-        print(f"通常SQL: {gen_sql}")
         
         conn = sqlite3.connect(DB_NAME)
         try:
@@ -198,7 +176,9 @@ async def chat_endpoint(req: ChatRequest):
         Mリーグ解説者として質問に答えてください。
         質問: {user_query}
         データ: {df_result.to_string()}
+        
         データがない場合は「該当データが見当たりませんでした」と答えてください。
+        数値は分かりやすく整形してください。
         """
         res_final = openai.chat.completions.create(
             model="gpt-4o", messages=[{"role": "system", "content": final_prompt}], temperature=0.3
