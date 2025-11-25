@@ -7,16 +7,7 @@ import openai
 import re
 import os
 
-# ==========================================
-# ★ APIキー設定 (本番用安全仕様) ★
-# ==========================================
 openai.api_key = os.getenv("OPENAI_API_KEY")
-
-# ローカルテスト用（GitHubに上げる時は削除するか、空にしておいてください）
-if not openai.api_key:
-    # 自分のキーを入れてテストする時はここを書き換える
-    # openai.api_key = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-    pass
 
 app = FastAPI()
 app.add_middleware(
@@ -25,69 +16,107 @@ app.add_middleware(
 
 DB_NAME = 'm_league.db'
 
-# 辞書読み込み（ログ表示機能付き）
-def get_db_vocabulary():
-    print("--- データベース読込開始 ---") # ★追加
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        cur = conn.cursor()
-        
-        # チーム名
-        cur.execute("SELECT DISTINCT team FROM stats")
-        teams = [r[0] for r in cur.fetchall() if r[0]]
-        
-        # 選手名
-        cur.execute("SELECT DISTINCT player FROM stats")
-        players = [r[0] for r in cur.fetchall() if r[0]]
-        
-        conn.close()
-        
-        # ★ここでログに出力！
-        print(f"✅ チーム読み込み: {len(teams)} チーム")
-        print(f"   {teams}") 
-        print(f"✅ 選手読み込み: {len(players)} 名")
-        print(f"   {players[:5]}...") # 最初5人だけ表示
-        
-        return ", ".join(teams), ", ".join(players)
-    except Exception as e:
-        print(f"❌ 読み込みエラー: {e}")
-        return "", ""
+# DB接続ヘルパー
+def get_connection():
+    return sqlite3.connect(DB_NAME)
 
-# サーバー起動時に実行
-TEAM_VOCAB, PLAYER_VOCAB = get_db_vocabulary()
-print("--- データベース読込完了 ---") # ★追加
+# 起動時ロード（失敗してもOK、リクエスト時に再ロードする仕様に変更）
+TEAM_VOCAB = ""
+PLAYER_VOCAB = ""
 
 class ChatRequest(BaseModel):
     message: str
 
+# ==========================================
+# ★ 追加機能: サーバー診断ページ ★
+# ==========================================
+@app.get("/debug")
+def debug_endpoint():
+    """サーバーの中身を覗き見するページ"""
+    try:
+        conn = get_connection()
+        
+        # 1. ファイルがあるか？
+        if not os.path.exists(DB_NAME):
+            return {"status": "CRITICAL ERROR", "message": "データベースファイル(m_league.db)がサーバーにありません！"}
+
+        # 2. statsテーブル（個人成績）チェック
+        try:
+            df_stats = pd.read_sql_query("SELECT * FROM stats", conn)
+            stats_count = len(df_stats)
+            sample_players = df_stats['player'].head(5).tolist() if not df_stats.empty else []
+            # 伊達プロチェック
+            date_check = df_stats[df_stats['player'].str.contains('伊達')]
+            date_exists = "いる！" if not date_check.empty else "いない..."
+        except Exception as e:
+            return {"status": "ERROR", "message": f"statsテーブル読み込み失敗: {e}"}
+
+        # 3. gamesテーブル（試合結果）チェック
+        try:
+            df_games = pd.read_sql_query("SELECT * FROM games", conn)
+            games_count = len(df_games)
+            latest_date = df_games['date'].max() if not df_games.empty else "なし"
+        except Exception as e:
+            return {"status": "ERROR", "message": f"gamesテーブル読み込み失敗: {e}"}
+
+        conn.close()
+
+        return {
+            "status": "OK",
+            "stats_count": f"{stats_count} 件 (個人成績)",
+            "sample_players": sample_players,
+            "date_san_check": f"伊達プロは... {date_exists}",
+            "games_count": f"{games_count} 件 (試合結果)",
+            "latest_game_date": f"最新の日付: {latest_date}"
+        }
+
+    except Exception as e:
+        return {"status": "SYSTEM ERROR", "error": str(e)}
+
+# ==========================================
+# チャット機能
+# ==========================================
 @app.post("/chat")
 async def chat_endpoint(req: ChatRequest):
     try:
+        # リクエストのたびに最新の辞書を読み込む（サーバー再起動なしでも反映されるように）
+        conn = get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT DISTINCT team FROM stats")
+            teams = [r[0] for r in cur.fetchall() if r[0]]
+            cur.execute("SELECT DISTINCT player FROM stats")
+            players = [r[0] for r in cur.fetchall() if r[0]]
+            global TEAM_VOCAB, PLAYER_VOCAB
+            TEAM_VOCAB = ", ".join(teams)
+            PLAYER_VOCAB = ", ".join(players)
+        except:
+            pass
+        finally:
+            conn.close()
+
         if not openai.api_key:
-            return {"reply": "【エラー】APIキーが設定されていません。RenderのEnvironment Variablesに 'OPENAI_API_KEY' を設定してください。", "graph": None}
+            return {"reply": "【エラー】APIキーが設定されていません。", "graph": None}
 
         user_query = req.message
         graph_data = None
         
-        # =========================================================
-        # 1. グラフ生成モード
-        # =========================================================
+        # 1. グラフモード
         if "推移" in user_query or "グラフ" in user_query:
             id_prompt = f"""
-            ユーザーは「ポイント推移」を知りたがっています。
-            質問: "{user_query}"
-            【DB内の正しい名称】チーム: {TEAM_VOCAB} 選手: {PLAYER_VOCAB}
-            【指示】質問対象を特定し、LIKE検索を使ったSQLを作成してください。
-            パターンA（チーム）: SELECT date, point, player FROM games WHERE player IN (SELECT player FROM stats WHERE team LIKE '%キーワード%') ORDER BY date;
-            パターンB（個人）: SELECT date, point, player FROM games WHERE player LIKE '%キーワード%' ORDER BY date;
-            回答はSQLのみ出力。
+            ユーザーは「ポイント推移」を知りたいです。質問: "{user_query}"
+            【正しい名前】チーム: {TEAM_VOCAB} 選手: {PLAYER_VOCAB}
+            【指示】質問対象を特定し、LIKE検索のSQLを作成してください。
+            パターンA(チーム): SELECT date, point, player FROM games WHERE player IN (SELECT player FROM stats WHERE team LIKE '%キーワード%') ORDER BY date;
+            パターンB(個人): SELECT date, point, player FROM games WHERE player LIKE '%キーワード%' ORDER BY date;
+            回答はSQLのみ。
             """
             res = openai.chat.completions.create(
                 model="gpt-4o", messages=[{"role": "system", "content": id_prompt}], temperature=0
             )
             sql = res.choices[0].message.content.strip().replace("```sql", "").replace("```", "")
             
-            conn = sqlite3.connect(DB_NAME)
+            conn = get_connection()
             try:
                 df = pd.read_sql_query(sql, conn)
                 if not df.empty:
@@ -95,11 +124,10 @@ async def chat_endpoint(req: ChatRequest):
                     df_grouped = df.groupby('date')['point'].sum().reset_index()
                     df_grouped['total_point'] = df_grouped['point'].cumsum()
                     
-                    label_name = "ポイント推移"
+                    label_name = "推移"
                     if "team" in sql.lower():
-                        match = re.search(r"team\s*LIKE\s*'%([^']*)%'", sql, re.IGNORECASE)
-                        label_name = f"{match.group(1)}のチーム推移" if match else "チーム推移"
-                    else:
+                        label_name = "チーム推移"
+                    elif not df.empty:
                         label_name = f"{df['player'].iloc[0]}の推移"
 
                     graph_data = {
@@ -110,58 +138,56 @@ async def chat_endpoint(req: ChatRequest):
                     final_prompt = f"""
                     Mリーグ実況者として解説してください。
                     質問: {user_query}
-                    データ: {df_grouped.tail(5).to_string()}
+                    データ(直近): {df_grouped.tail(5).to_string()}
                     「グラフをご覧ください」と添えてください。
                     """
                     res_text = openai.chat.completions.create(
                         model="gpt-4o", messages=[{"role": "system", "content": final_prompt}], temperature=0.3
                     )
                     return {"reply": res_text.choices[0].message.content, "graph": graph_data}
-            except Exception as e:
-                print(f"グラフエラー: {e}")
+            except:
+                pass
             finally:
                 conn.close()
 
-        # =========================================================
-        # 2. 最新結果・順位モード
-        # =========================================================
-        elif "順位" in user_query or "ランキング" in user_query or "最新" in user_query or "試合結果" in user_query:
-            conn = sqlite3.connect(DB_NAME)
+        # 2. 最新結果モード
+        elif "最新" in user_query or "試合結果" in user_query:
+            conn = get_connection()
             try:
-                sql_games = "SELECT date, game_count, rank, player, point FROM games ORDER BY date DESC, game_count DESC, rank ASC LIMIT 8"
-                df_games = pd.read_sql_query(sql_games, conn)
-                sql_ranking = "SELECT rank, team, point FROM team_ranking ORDER BY rank"
-                df_ranking = pd.read_sql_query(sql_ranking, conn)
-                combined_data = f"【直近の試合結果】\n{df_games.to_string()}\n\n【現在のチーム順位】\n{df_ranking.to_string()}"
-                
+                sql = "SELECT date, game_count, rank, player, point FROM games ORDER BY date DESC, game_count DESC, rank ASC LIMIT 8"
+                df = pd.read_sql_query(sql, conn)
+                sql_rk = "SELECT rank, team, point FROM team_ranking ORDER BY rank"
+                df_rk = pd.read_sql_query(sql_rk, conn)
+                combined = f"【直近試合】\n{df.to_string()}\n【チーム順位】\n{df_rk.to_string()}"
                 final_prompt = f"""
-                あなたはMリーグの公式リポーターです。
-                質問「{user_query}」に対し、以下のデータを元に見やすく報告してください。
-                【データ】{combined_data}
-                【重要：表示ルールの厳守】
-                1. ハイフン「-」を区切り文字に使わないでください。
-                2. チーム順位は「1位: **チーム名** (540.0pt)」の形式で。
-                3. マイナスのポイントは `▲` または `-` を数字の直前につけてください。プラスの場合は記号なし。
-                4. 順位に応じた絵文字(🥇,🥈,🥉,4️⃣,🏆)を使用。
-                5. チーム名や選手名は **太字** にする。
+                Mリーグ公式リポーターとして報告してください。
+                データ: {combined}
+                ルール:
+                - 日付ごとに第1/第2試合を分ける
+                - 順位は絵文字(🥇🥈🥉4️⃣)付き
+                - チーム順位も記載
+                - 選手名・チーム名は太字(**)
+                - マイナスは▲表記
                 """
-                res_final = openai.chat.completions.create(
+                res = openai.chat.completions.create(
                     model="gpt-4o", messages=[{"role": "system", "content": final_prompt}], temperature=0.3
                 )
-                return {"reply": res_final.choices[0].message.content, "graph": None}
-            except Exception as e:
-                return {"reply": f"データ取得エラー: {e}", "graph": None}
+                return {"reply": res.choices[0].message.content, "graph": None}
             finally:
                 conn.close()
 
-        # =========================================================
         # 3. 通常モード
-        # =========================================================
         sql_prompt = f"""
         あなたはMリーグのデータエンジニアです。
         質問「{user_query}」に対し、適切なSQLを作成してください。
-        【DB内の正しい名前リスト】チーム: {TEAM_VOCAB} 選手: {PLAYER_VOCAB}
-        【指示】ユーザーの入力を上記リストの正しい名前に脳内変換し、LIKE検索を使ってください。
+        【正しい名前】選手: {PLAYER_VOCAB} チーム: {TEAM_VOCAB}
+        【指示】ユーザー入力を上記リストの名前に変換し、LIKE検索してください。
+        
+        テーブル:
+        1. stats (通算): player, team, points, riichi_rate, agari_rate, hoju_rate ...
+        2. games (日別): date, rank, player, point
+        3. team_ranking (順位): rank, team, point
+        
         回答はSQLのみ。
         """
         res_sql = openai.chat.completions.create(
@@ -169,7 +195,7 @@ async def chat_endpoint(req: ChatRequest):
         )
         gen_sql = res_sql.choices[0].message.content.strip().replace("```sql", "").replace("```", "")
         
-        conn = sqlite3.connect(DB_NAME)
+        conn = get_connection()
         try:
             df_result = pd.read_sql_query(gen_sql, conn)
         except:
@@ -181,15 +207,11 @@ async def chat_endpoint(req: ChatRequest):
         Mリーグ解説者として質問に答えてください。
         質問: {user_query}
         データ: {df_result.to_string()}
-        【表示ルール】
-        - 区切り文字としてハイフン「-」は絶対に使わないでください。
-        - 「項目名: 値」の形式を使ってください。
-        - データが見当たらない場合は正直に伝えてください。
+        データがない場合は「該当データが見当たりませんでした」と回答。
         """
         res_final = openai.chat.completions.create(
             model="gpt-4o", messages=[{"role": "system", "content": final_prompt}], temperature=0.3
         )
-        
         return {"reply": res_final.choices[0].message.content, "graph": None}
 
     except Exception as e:
