@@ -35,7 +35,7 @@ def scrape_points(conn):
                 if len(cols) >= 3:
                     try:
                         rank = int(cols[0].get_text(strip=True))
-                        name = cols[1].get_text(strip=True) # チーム名はそのまま
+                        name = cols[1].get_text(strip=True)
                         point_str = cols[2].get_text(strip=True)
                         point = float(point_str.replace('pt', '').replace('▲', '-').replace(',', ''))
                         data.append({"rank": rank, "team": name, "point": point})
@@ -74,7 +74,7 @@ def scrape_points(conn):
         print("❌ チーム順位の取得に失敗しました。")
 
 # -------------------------------------------------------
-# 2. 試合結果 (games) - ★名前の空白削除を追加
+# 2. 試合結果 (games) - ★日付のゼロ埋め修正を追加！
 # -------------------------------------------------------
 def scrape_games(conn):
     soup = get_soup("https://m-league.jp/games/")
@@ -85,19 +85,28 @@ def scrape_games(conn):
     
     for modal in modals:
         try:
+            # 日付テキストを取得 (例: "9/30(火)")
             date_text = modal.find('div', class_='p-gamesResult__date').get_text(strip=True)
-            date_str = f"2025/{date_text.split('(')[0]}"
+            
+            # ★ここを修正: "9/30" -> "09/30" に変換して保存する
+            month_day = date_text.split('(')[0] # "9/30"
+            parts = month_day.split('/')
+            if len(parts) == 2:
+                month = int(parts[0])
+                day = int(parts[1])
+                # {:02d} で2桁ゼロ埋めにする (9->09)
+                date_str = f"2025/{month:02d}/{day:02d}" 
+            else:
+                date_str = f"2025/{month_day}"
+
             columns = modal.find_all('div', class_='p-gamesResult__column')
             for col in columns:
                 game_num = col.find('div', class_='p-gamesResult__number').get_text(strip=True)
                 rank_items = col.find_all('div', class_='p-gamesResult__rank-item')
                 for item in rank_items:
                     rank = item.find('div', class_='p-gamesResult__rank-badge').get_text(strip=True)
-                    
-                    # ★ここで名前の空白を削除！
                     player = item.find('div', class_='p-gamesResult__name').get_text(strip=True)
-                    player = player.replace(" ", "").replace("　", "") 
-                    
+                    player = player.replace(" ", "").replace("　", "")
                     point_text = item.find('div', class_='p-gamesResult__point').get_text(strip=True)
                     point = float(point_text.replace('pt', '').replace('▲', '-').replace(',', ''))
                     data.append({"date": date_str, "game_count": game_num, "rank": int(rank), "player": player, "point": point})
@@ -110,7 +119,7 @@ def scrape_games(conn):
         print(f"✅ 試合結果: {len(df)} 件保存完了")
 
 # -------------------------------------------------------
-# 3. 個人成績 (stats) - ★名前の空白削除を追加
+# 3. 個人成績 (stats)
 # -------------------------------------------------------
 def scrape_stats(conn):
     soup = get_soup("https://m-league.jp/stats/")
@@ -125,10 +134,7 @@ def scrape_stats(conn):
             table = section.find('table', class_='p-stats__table')
             if not table: continue
             rows = table.find_all('tr')
-            
-            # ★ヘッダーの名前からも空白を削除
             players = [p.get_text(strip=True).replace(" ", "").replace("　", "") for p in rows[0].find_all('th')[1:]]
-            
             player_stats = {p: {'team': team_name, 'player': p} for p in players}
             
             key_map = {
@@ -161,7 +167,7 @@ def scrape_stats(conn):
 
 if __name__ == "__main__":
     conn = sqlite3.connect(DB_NAME)
-    print("--- データ更新開始 (空白削除モード) ---")
+    print("--- データ更新開始 (日付ゼロ埋め版) ---")
     scrape_points(conn)
     scrape_games(conn)
     scrape_stats(conn)
