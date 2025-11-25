@@ -30,6 +30,7 @@ def get_db_vocabulary():
         cur.execute("SELECT DISTINCT player FROM stats")
         players = [r[0] for r in cur.fetchall() if r[0]]
         conn.close()
+        # ログには出すが、本番環境のログは見えないことが多いのでエラー時のみ注意
         return ", ".join(teams), ", ".join(players)
     except:
         return "", ""
@@ -44,7 +45,7 @@ async def chat_endpoint(req: ChatRequest):
     try:
         # もしAPIキーが設定されていなければエラーを返す（安全装置）
         if not openai.api_key:
-            return {"reply": "【エラー】APIキーが設定されていません。RenderのEnvironment Variablesを確認してください。", "graph": None}
+            return {"reply": "【エラー】APIキーが設定されていません。RenderのEnvironment Variablesに 'OPENAI_API_KEY' を設定してください。", "graph": None}
 
         user_query = req.message
         graph_data = None
