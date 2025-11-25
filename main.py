@@ -4,7 +4,6 @@ from fastapi.middleware.cors import CORSMiddleware
 import sqlite3
 import pandas as pd
 import openai
-import re
 import os
 
 # ==========================================
@@ -24,6 +23,7 @@ def get_connection():
     return sqlite3.connect(DB_NAME)
 
 # 起動時にDBから名前リストを読み込む
+# ★ここが修正箇所：関数名を統一しました
 def get_db_vocabulary():
     try:
         conn = get_connection()
@@ -37,6 +37,7 @@ def get_db_vocabulary():
     except:
         return "", ""
 
+# グローバル変数として保持（起動時ロード）
 TEAM_VOCAB, PLAYER_VOCAB = get_db_vocabulary()
 
 # サーバー診断ページ (/debug)
@@ -70,8 +71,8 @@ async def chat_endpoint(req: ChatRequest):
         user_query = req.message
         graph_data = None
         
-        # 毎回最新の辞書を取得
-        team_vocab, player_vocab = get_vocab()
+        # ★ここを修正しました（正しい関数名で呼び出し）
+        team_vocab, player_vocab = get_db_vocabulary()
 
         # ---------------------------------------------------------
         # 1. グラフ生成モード
@@ -121,8 +122,6 @@ async def chat_endpoint(req: ChatRequest):
                     return {"reply": res_text.choices[0].message.content, "graph": graph_data}
                 else:
                      return {"reply": f"データが見つかりませんでした。\n試行したSQL: `{sql}`", "graph": None}
-            except Exception as e:
-                print(f"グラフエラー: {e}")
             finally:
                 conn.close()
 
@@ -134,7 +133,8 @@ async def chat_endpoint(req: ChatRequest):
             ユーザーの質問から、分析対象となる「選手名」を全て抽出してください。
             質問: "{user_query}"
             【選手名簿】{player_vocab}
-            回答は選手名をカンマ区切りで出すだけ。
+            回答は選手名をカンマ区切りで出すだけ。（例: 多井隆晴, 伊達朱里紗）
+            もしチーム名が書かれていたら、そのチームの代表的な選手を1名選んでください。
             """
             res_names = openai.chat.completions.create(
                 model="gpt-4o", messages=[{"role": "system", "content": extract_prompt}], temperature=0
@@ -142,7 +142,7 @@ async def chat_endpoint(req: ChatRequest):
             target_names = [n.strip() for n in res_names.choices[0].message.content.split(',') if n.strip()]
             
             if not target_names:
-                return {"reply": "分析対象の選手名が特定できませんでした。", "graph": None}
+                return {"reply": "分析対象の選手名が特定できませんでした。選手名を入れて質問してください。", "graph": None}
 
             conn = get_connection()
             try:
@@ -159,15 +159,20 @@ async def chat_endpoint(req: ChatRequest):
 
                 final_prompt = f"""
                 あなたはMリーグのプロアナリストです。
-                質問: "{user_query}"
+                ユーザーの質問: "{user_query}"
                 
-                【今期スタッツ】{df_stats.to_string(index=False)}
-                【直近成績】{recent_data_text}
+                以下の「客観的なデータ」を元に、論理的な分析・予想を行ってください。
+                
+                【対象選手の今期スタッツ】
+                {df_stats.to_string(index=False)}
+                
+                【対象選手の直近成績（勢い）】
+                {recent_data_text}
                 
                 【指示】
-                - スタッツと勢いを総合して、論理的に分析してください。
-                - 確率(0.x)は%に変換して話してください (例: 0.25 -> 25%)
-                - 「※データに基づく予想です」と注釈を入れてください。
+                - 「勝敗予想」の場合は、スタッツ（平均着順やポイント）と直近の勢いを総合して、最も勝率が高そうな選手を1名挙げ、理由を解説してください。
+                - 「対戦成績・相性」の場合は、それぞれのデータの強み（攻撃型か守備型かなど）を比較してください。
+                - 最後に必ず「※データに基づく予想であり、結果を保証するものではありません」と注釈を入れてください。
                 """
                 res_final = openai.chat.completions.create(
                     model="gpt-4o", messages=[{"role": "system", "content": final_prompt}], temperature=0.7
@@ -189,59 +194,62 @@ async def chat_endpoint(req: ChatRequest):
                 combined_data = f"【直近の試合結果】\n{df_games.to_string()}\n\n【現在のチーム順位】\n{df_ranking.to_string()}"
                 
                 final_prompt = f"""
-                Mリーグ公式リポーターとして報告してください。
-                データ: {combined_data}
-                ルール:
-                - ハイフン区切り禁止。
-                - 順位は絵文字(🥇🥈🥉4️⃣🏆)付き。
-                - チーム順位は「1位: **チーム名** (500.0pt)」形式。
-                - マイナスは「▲」を使用。
+                あなたはMリーグの公式リポーターです。
+                質問「{user_query}」に対し、以下のデータを元に見やすく報告してください。
+                【データ】{combined_data}
+                【重要：表示ルールの厳守】
+                1. **ハイフン「-」を区切り文字に使わないでください**。
+                2. チーム順位は以下の形式で書いてください：
+                   1位: **チーム名** (540.0pt)
+                3. マイナスのポイントは `▲` または `-` を数字の直前につけてください。
+                4. 順位に応じた絵文字(🥇,🥈,🥉,4️⃣,🏆)を使ってください。
+                5. チーム名や選手名は **太字** にしてください。
                 """
                 res_final = openai.chat.completions.create(
                     model="gpt-4o", messages=[{"role": "system", "content": final_prompt}], temperature=0.3
                 )
                 return {"reply": res_final.choices[0].message.content, "graph": None}
+            except Exception as e:
+                return {"reply": f"データ取得エラー: {e}", "graph": None}
             finally:
                 conn.close()
 
         # ---------------------------------------------------------
-        # 4. 通常モード（★ここを修正！）
+        # 4. 通常モード
         # ---------------------------------------------------------
         sql_prompt = f"""
-        MリーグデータエンジニアとしてSQLを作成してください。
-        質問: {user_query}
+        あなたはMリーグのデータエンジニアです。
+        質問「{user_query}」に対し、適切なSQLを作成してください。
         【正しい名前】選手: {player_vocab} チーム: {team_vocab}
         
-        指示:
-        - ユーザー入力をリストの名前に変換し、LIKE検索を使用。
-        - 「スタッツ」などの漠然とした質問なら SELECT * で全カラム取得。
-        - 「放銃率」「リーチ率」など特定の指標なら、それを含む SELECT 文。
+        【重要】
+        - DB内の名前に「スペース」は含まれません（例: '伊達朱里紗'）。
+        - 検索時は必ず LIKE '%キーワード%' を使ってください。
+        - '伊達 朱里紗' のようなスペース入りは禁止です。
         
         テーブル:
-        1. stats (通算): riichi_rate(リーチ率), agari_rate(和了率), hoju_rate(放銃率)...
+        1. stats (通算): player, team, points, riichi_rate, agari_rate, hoju_rate...
         2. games (日別): date, rank, player, point
-        3. team_ranking (順位)
+        3. team_ranking (順位): rank, team, point
         
         回答はSQLのみ。
         """
         res_sql = openai.chat.completions.create(
             model="gpt-4o", messages=[{"role": "system", "content": sql_prompt}], temperature=0
         )
-        gen_sql = res_sql.choices[0].message.content.strip().replace("```sql", "").replace("```", "")
-        print(f"💬 通常SQL: {gen_sql}")
+        sql = res_sql.choices[0].message.content.strip().replace("```sql", "").replace("```", "")
         
         conn = get_connection()
         try:
-            df_result = pd.read_sql_query(gen_sql, conn)
+            df_result = pd.read_sql_query(sql, conn)
         except:
             df_result = pd.DataFrame()
         finally:
             conn.close()
 
         if df_result.empty:
-             return {"reply": f"該当データが見当たりませんでした。\n(実行SQL: `{gen_sql}`)", "graph": None}
+             return {"reply": f"該当データが見当たりませんでした。\n(実行SQL: `{sql}`)", "graph": None}
 
-        # ★ここが修正ポイント：数値の読み方を徹底指導★
         final_prompt = f"""
         Mリーグ解説者として質問に答えてください。
         質問: {user_query}
@@ -252,7 +260,6 @@ async def chat_endpoint(req: ChatRequest):
         2. 回答する際は、必ず **100倍してパーセント表記** に直してください。
            - 0.25 -> 25%
            - 0.08 -> 8%
-           - 0.0 -> 0%
         3. 小数をそのまま「0.08です」や、丸めて「0です」と答えるのは禁止です。
         4. ハイフン「-」区切り禁止。「項目: 値」の形式で。
         """
