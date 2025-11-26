@@ -127,7 +127,7 @@ async def chat_endpoint(req: ChatRequest):
         # ---------------------------------------------------------
         # 2. アナリストモード（勝敗予想・対戦成績）
         # ---------------------------------------------------------
-        elif "予想" in user_query or "対戦" in user_query or "相性" in user_query or "vs" in user_query.lower():
+        elif "予想" in user_query or "成績" in user_query or "相性" in user_query or "vs" in user_query.lower():
             extract_prompt = f"""
             ユーザーの質問から、分析対象となる「選手名」を全て抽出してください。
             質問: "{user_query}"
