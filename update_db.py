@@ -3,6 +3,7 @@ from bs4 import BeautifulSoup
 import pandas as pd
 import sqlite3
 import re
+import uuid # ID生成用
 
 DB_NAME = 'm_league.db'
 
@@ -17,9 +18,7 @@ def get_soup(url):
         print(f"エラー: {e}")
         return None
 
-# -------------------------------------------------------
-# 1. チーム順位
-# -------------------------------------------------------
+# 1. チーム順位 (変更なし)
 def scrape_points(conn):
     soup = get_soup("https://m-league.jp/points/")
     if not soup: return
@@ -55,26 +54,20 @@ def scrape_points(conn):
                     point = float(team.find(class_='p-ranking__current-point').get_text(strip=True).replace('pt', '').replace('▲', '-').replace(',', ''))
                     data.append({"rank": int(rank), "team": name, "point": point})
                 except: continue
-
     if data:
         df = pd.DataFrame(data)
         df.to_sql('team_ranking', conn, if_exists='replace', index=False)
         print(f"✅ チーム順位: {len(df)} チーム")
 
-# -------------------------------------------------------
-# 2. 試合結果 (★ここを修正！重複チェックを削除)
-# -------------------------------------------------------
+# 2. 試合結果 (★match_id追加版)
 def scrape_games(conn):
     base_url = "https://m-league.jp/games/"
     soup = get_soup(base_url)
     if not soup: return
 
     all_games = []
-    
-    # 重複チェック用のセットを削除しました
-    # 公式サイトのモーダルは全てユニークなIDを持っているため、単純に全部取得すればOKです
-
     modals = soup.find_all('div', class_='c-modal2')
+    
     for modal in modals:
         try:
             date_text = modal.find('div', class_='p-gamesResult__date').get_text(strip=True)
@@ -86,32 +79,39 @@ def scrape_games(conn):
                 date_str = f"2025/{month_day}"
 
             columns = modal.find_all('div', class_='p-gamesResult__column')
+            
             for col in columns:
-                game_num = col.find('div', class_='p-gamesResult__number').get_text(strip=True)
+                # ここで試合ごとのユニークIDを発行！
+                # これにより、同じ日・同じ回数でも別卓なら区別できる
+                current_match_id = str(uuid.uuid4())
                 
-                # ★削除した部分: if unique_key in processed_dates: continue
-
+                game_num = col.find('div', class_='p-gamesResult__number').get_text(strip=True)
                 rank_items = col.find_all('div', class_='p-gamesResult__rank-item')
+                
                 for item in rank_items:
                     rank = item.find('div', class_='p-gamesResult__rank-badge').get_text(strip=True)
                     player = item.find('div', class_='p-gamesResult__name').get_text(strip=True).replace(" ", "").replace("　", "")
                     point = float(item.find('div', class_='p-gamesResult__point').get_text(strip=True).replace('pt', '').replace('▲', '-').replace(',', ''))
-                    all_games.append({"date": date_str, "game_count": game_num, "rank": int(rank), "player": player, "point": point})
+                    
+                    all_games.append({
+                        "match_id": current_match_id, # ★追加
+                        "date": date_str, 
+                        "game_count": game_num, 
+                        "rank": int(rank), 
+                        "player": player, 
+                        "point": point
+                    })
         except: continue
 
     if all_games:
         df = pd.DataFrame(all_games)
-        # ソートして保存
         df = df.sort_values(by=['date', 'game_count'])
         df.to_sql('games', conn, if_exists='replace', index=False)
-        print(f"✅ 試合結果: {len(df)} 件保存完了")
-        print(f"   📅 データ期間: {df['date'].min()} 〜 {df['date'].max()}")
+        print(f"✅ 試合結果: {len(df)} 件 (match_id付与完了)")
     else:
-        print("⚠️ 試合結果が見つかりませんでした。")
+        print("⚠️ 試合結果なし")
 
-# -------------------------------------------------------
-# 3. 個人成績
-# -------------------------------------------------------
+# 3. 個人成績 (変更なし)
 def scrape_stats(conn):
     soup = get_soup("https://m-league.jp/stats/")
     if not soup: return
@@ -146,7 +146,7 @@ def scrape_stats(conn):
 
 if __name__ == "__main__":
     conn = sqlite3.connect(DB_NAME)
-    print("--- データ全回収開始（重複許容版） ---")
+    print("--- ID付きデータ更新開始 ---")
     scrape_points(conn)
     scrape_games(conn)
     scrape_stats(conn)

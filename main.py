@@ -213,7 +213,7 @@ async def chat_endpoint(req: ChatRequest):
             finally:
                 conn.close()
         # ---------------------------------------------------------
-        # 4. ★直接対決・全記録モード（ここを追加・強化！）
+        # 4. ★直接対決・全記録モード（match_id 対応版）
         # ---------------------------------------------------------
         elif "対戦" in user_query and ("と" in user_query or "vs" in user_query.lower()):
             
@@ -239,8 +239,8 @@ async def chat_endpoint(req: ChatRequest):
 
             conn = get_connection()
             try:
-                # Step B: 「二人が同卓した試合」を特定する高度なSQL
-                # (gamesテーブルを自己結合して、同じ日付・同じ回戦に両者がいるレコードを探す)
+                # Step B: 「二人が同卓した試合」を特定する SQL
+                # ★修正ポイント: match_id で結合して、本当に同卓した試合だけを抽出
                 sql_matchup = f"""
                 SELECT 
                     T1.date as 日付,
@@ -248,7 +248,7 @@ async def chat_endpoint(req: ChatRequest):
                     T1.player as 選手A, T1.rank as 着順A, T1.point as PtA,
                     T2.player as 選手B, T2.rank as 着順B, T2.point as PtB
                 FROM games T1
-                JOIN games T2 ON T1.date = T2.date AND T1.game_count = T2.game_count
+                JOIN games T2 ON T1.match_id = T2.match_id  -- ★ここを match_id で結合に変更！
                 WHERE T1.player LIKE '%{p1_name}%' 
                   AND T2.player LIKE '%{p2_name}%'
                 ORDER BY T1.date DESC
@@ -283,7 +283,6 @@ async def chat_endpoint(req: ChatRequest):
             
             finally:
                 conn.close()
-
         # ---------------------------------------------------------
         # 5. 通常モード（★ここを最強の有能AIに改造しました！）
         # ---------------------------------------------------------
