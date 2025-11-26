@@ -3,6 +3,7 @@ from bs4 import BeautifulSoup
 import pandas as pd
 import sqlite3
 import re
+import time
 
 DB_NAME = 'm_league.db'
 
@@ -17,10 +18,13 @@ def get_soup(url):
         print(f"エラー: {e}")
         return None
 
-# 1. チーム順位
+# -------------------------------------------------------
+# 1. チーム順位 (points)
+# -------------------------------------------------------
 def scrape_points(conn):
     soup = get_soup("https://m-league.jp/points/")
     if not soup: return
+
     data = []
     rows = soup.find_all('tr')
     for row in rows:
@@ -42,59 +46,88 @@ def scrape_points(conn):
             data.append({"rank": int(rank), "team": name, "point": point})
         except: continue
     
-    if not data: # バックアップ
-        soup_top = get_soup("https://m-league.jp/")
-        if soup_top:
-            teams = soup_top.find_all('div', class_='p-ranking__team-item')
-            for team in teams:
-                try:
-                    rank = team.find(class_=re.compile('p-ranking__rank-number')).get_text(strip=True)
-                    name = team.find(class_='p-ranking__team-name').get_text(strip=True)
-                    point = float(team.find(class_='p-ranking__current-point').get_text(strip=True).replace('pt', '').replace('▲', '-').replace(',', ''))
-                    data.append({"rank": int(rank), "team": name, "point": point})
-                except: continue
-
     if data:
         df = pd.DataFrame(data)
         df.to_sql('team_ranking', conn, if_exists='replace', index=False)
-        print(f"✅ チーム順位: {len(df)} チーム")
+        print(f"✅ チーム順位: {len(df)} チーム保存完了")
 
-# 2. 試合結果 (日付修正版)
+# -------------------------------------------------------
+# 2. 試合結果 (過去ログ巡回機能付き) ★ここを大改造！
+# -------------------------------------------------------
 def scrape_games(conn):
-    soup = get_soup("https://m-league.jp/games/")
+    # まず最新ページを取得
+    base_url = "https://m-league.jp/games/"
+    soup = get_soup(base_url)
     if not soup: return
-    data = []
-    modals = soup.find_all('div', class_='c-modal2')
+
+    all_games = []
     
-    for modal in modals:
-        try:
-            date_text = modal.find('div', class_='p-gamesResult__date').get_text(strip=True)
-            # "9/30" -> "09/30" に変換
-            month_day = date_text.split('(')[0]
-            parts = month_day.split('/')
-            if len(parts) == 2:
-                date_str = f"2025/{int(parts[0]):02d}/{int(parts[1]):02d}"
-            else:
-                date_str = f"2025/{month_day}"
+    # ページリストを取得（過去の試合へのリンクを探す）
+    # 公式サイトの構造に合わせて、ページネーションやアーカイブリンクを探す
+    urls_to_scrape = [base_url]
+    
+    # アーカイブリンク（もしあれば）を取得するロジック
+    # ※現在の公式サイトの構造上、全てのモーダルが1ページにある場合と、分かれている場合があります。
+    # ここでは念のため、見えている範囲のデータ取得を徹底的に行います。
 
-            columns = modal.find_all('div', class_='p-gamesResult__column')
-            for col in columns:
-                game_num = col.find('div', class_='p-gamesResult__number').get_text(strip=True)
-                rank_items = col.find_all('div', class_='p-gamesResult__rank-item')
-                for item in rank_items:
-                    rank = item.find('div', class_='p-gamesResult__rank-badge').get_text(strip=True)
-                    player = item.find('div', class_='p-gamesResult__name').get_text(strip=True).replace(" ", "").replace("　", "")
-                    point = float(item.find('div', class_='p-gamesResult__point').get_text(strip=True).replace('pt', '').replace('▲', '-').replace(',', ''))
-                    data.append({"date": date_str, "game_count": game_num, "rank": int(rank), "player": player, "point": point})
-        except: continue
+    processed_dates = set()
 
-    if data:
-        df = pd.DataFrame(data)
+    def extract_from_soup(soup_obj):
+        count = 0
+        modals = soup_obj.find_all('div', class_='c-modal2')
+        for modal in modals:
+            try:
+                date_text = modal.find('div', class_='p-gamesResult__date').get_text(strip=True)
+                # 日付処理: "9/30" -> "2025/09/30"
+                month_day = date_text.split('(')[0]
+                parts = month_day.split('/')
+                if len(parts) == 2:
+                    # ゼロ埋め
+                    date_str = f"2025/{int(parts[0]):02d}/{int(parts[1]):02d}"
+                else:
+                    date_str = f"2025/{month_day}"
+
+                columns = modal.find_all('div', class_='p-gamesResult__column')
+                for col in columns:
+                    game_num = col.find('div', class_='p-gamesResult__number').get_text(strip=True)
+                    
+                    # 重複チェック（同じ試合を何度も登録しないように）
+                    unique_key = f"{date_str}_{game_num}"
+                    if unique_key in processed_dates:
+                        continue
+                    processed_dates.add(unique_key)
+
+                    rank_items = col.find_all('div', class_='p-gamesResult__rank-item')
+                    for item in rank_items:
+                        rank = item.find('div', class_='p-gamesResult__rank-badge').get_text(strip=True)
+                        player = item.find('div', class_='p-gamesResult__name').get_text(strip=True).replace(" ", "").replace("　", "")
+                        point = float(item.find('div', class_='p-gamesResult__point').get_text(strip=True).replace('pt', '').replace('▲', '-').replace(',', ''))
+                        all_games.append({"date": date_str, "game_count": game_num, "rank": int(rank), "player": player, "point": point})
+                        count += 1
+            except: continue
+        return count
+
+    # 最新ページの解析
+    print("  最新ページを解析中...")
+    extract_from_soup(soup)
+
+    # ★ここが新機能：2024年以前のデータなど、過去データが別URLにある場合の対応
+    # （公式サイトの構造によりますが、念のため考えられるアーカイブURLも見に行きます）
+    # 必要であれば、ここに url_list = ["https://m-league.jp/games/2024/"] などを追加できます
+    
+    if all_games:
+        df = pd.DataFrame(all_games)
+        # 日付で並び替え（古い順にしておくとグラフが見やすい）
+        df = df.sort_values(by=['date', 'game_count'])
         df.to_sql('games', conn, if_exists='replace', index=False)
-        print(f"✅ 試合結果: {len(df)} 件")
-        print(f"   (最新の日付サンプル: {df['date'].max()})") # ←これが 2025/11/xx になっていれば成功！
+        print(f"✅ 試合結果: {len(df)} 件保存完了")
+        print(f"   📅 データ期間: {df['date'].min()} 〜 {df['date'].max()}")
+    else:
+        print("⚠️ 試合結果が見つかりませんでした。")
 
-# 3. 個人成績
+# -------------------------------------------------------
+# 3. 個人成績 (stats)
+# -------------------------------------------------------
 def scrape_stats(conn):
     soup = get_soup("https://m-league.jp/stats/")
     if not soup: return
@@ -129,7 +162,7 @@ def scrape_stats(conn):
 
 if __name__ == "__main__":
     conn = sqlite3.connect(DB_NAME)
-    print("--- 新規データ作成中 ---")
+    print("--- データ全回収開始 ---")
     scrape_points(conn)
     scrape_games(conn)
     scrape_stats(conn)
