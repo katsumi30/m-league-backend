@@ -212,9 +212,80 @@ async def chat_endpoint(req: ChatRequest):
                 return {"reply": f"データ取得エラー: {e}", "graph": None}
             finally:
                 conn.close()
+        # ---------------------------------------------------------
+        # 4. ★直接対決・全記録モード（ここを追加・強化！）
+        # ---------------------------------------------------------
+        elif "対戦" in user_query and ("と" in user_query or "vs" in user_query.lower()):
+            
+            # Step A: 対戦する2名を特定
+            extract_prompt = f"""
+            ユーザーの質問から「対戦成績を比較したい2名の選手名」を抽出してください。
+            
+            質問: "{user_query}"
+            【選手名簿】{player_vocab}
+            
+            回答は選手名をカンマ区切りで出すだけ。（例: 多井隆晴, 鈴木優）
+            """
+            res_names = openai.chat.completions.create(
+                model="gpt-4o", messages=[{"role": "system", "content": extract_prompt}], temperature=0
+            )
+            names = [n.strip() for n in res_names.choices[0].message.content.split(',') if n.strip()]
+            
+            if len(names) < 2:
+                return {"reply": "対戦する2名の選手名が見つかりませんでした。「多井隆晴と鈴木優の対戦成績」のように聞いてみてください。", "graph": None}
+
+            p1_name = names[0]
+            p2_name = names[1]
+
+            conn = get_connection()
+            try:
+                # Step B: 「二人が同卓した試合」を特定する高度なSQL
+                # (gamesテーブルを自己結合して、同じ日付・同じ回戦に両者がいるレコードを探す)
+                sql_matchup = f"""
+                SELECT 
+                    T1.date as 日付,
+                    T1.game_count as 回戦,
+                    T1.player as 選手A, T1.rank as 着順A, T1.point as PtA,
+                    T2.player as 選手B, T2.rank as 着順B, T2.point as PtB
+                FROM games T1
+                JOIN games T2 ON T1.date = T2.date AND T1.game_count = T2.game_count
+                WHERE T1.player LIKE '%{p1_name}%' 
+                  AND T2.player LIKE '%{p2_name}%'
+                ORDER BY T1.date DESC
+                """
+                
+                df_match = pd.read_sql_query(sql_matchup, conn)
+                
+                if df_match.empty:
+                     return {"reply": f"データ上、{p1_name}選手と{p2_name}選手の直接対決は見つかりませんでした。", "graph": None}
+
+                # Step C: 結果をAIに解説させる
+                final_prompt = f"""
+                あなたはMリーグのデータアナリストです。
+                ユーザーの質問「{user_query}」に対し、以下の「直接対決の全記録」を元に解説してください。
+                
+                【直接対決データ ({len(df_match)}戦)】
+                {df_match.to_string(index=False)}
+                
+                【出力ルール】
+                1. **「トータルでどちらが勝ち越しているか（先着数など）」** をまず結論として述べてください。
+                2. その後、**対戦履歴のリスト** を見やすく表示してください。
+                   例: 
+                   📅 11/21 第1試合
+                   👊 **多井** (1位 +50.0) vs **鈴木** (3位 -20.0)
+                3. 最後に「どちらが得意としているか」の相性分析を添えてください。
+                """
+                
+                res_final = openai.chat.completions.create(
+                    model="gpt-4o", messages=[{"role": "system", "content": final_prompt}], temperature=0.5
+                )
+                return {"reply": res_final.choices[0].message.content, "graph": None}
+            
+            finally:
+                conn.close()
 
         # ---------------------------------------------------------
-        # 4. 通常モード（★ここを最強の有能AIに改造しました！）
+        # 5. 通常モード（★ここを最強の有能AIに改造しました！）
         # ---------------------------------------------------------
         table_info = """
         【テーブル定義書】
