@@ -181,84 +181,125 @@ async def chat_endpoint(req: ChatRequest):
                 conn.close()
 
         # ---------------------------------------------------------
-        # 3. 最新結果・順位モード（同日複数卓 強制分割版）
+        # 3. 最新結果・順位モード（個人ランキング対応 ＆ 試合結果強制分割）
         # ---------------------------------------------------------
         elif "順位" in user_query or "ランキング" in user_query or "最新" in user_query or "試合結果" in user_query:
             conn = get_connection()
             try:
-                # 日付指定があるかチェック
-                date_match = re.search(r'(\d{1,2})月(\d{1,2})日', user_query)
-                
-                df_games = pd.DataFrame()
-                target_display_date = "直近"
-
-                if date_match:
-                    month = int(date_match.group(1))
-                    day = int(date_match.group(2))
-                    target_date = f"2025/{month:02d}/{day:02d}"
-                    target_display_date = f"{month}月{day}日"
-
-                    # match_id順に取得
-                    sql_games = """
-                    SELECT match_id, date, game_count, rank, player, point 
-                    FROM games 
-                    WHERE date = ? 
-                    ORDER BY game_count ASC, match_id ASC, rank ASC
-                    """
-                    df_games = pd.read_sql_query(sql_games, conn, params=[target_date])
-                
-                else:
-                    # 日付指定がない場合（直近）
-                    sql_games = "SELECT match_id, date, game_count, rank, player, point FROM games ORDER BY date DESC, game_count DESC, rank ASC LIMIT 8"
-                    df_games = pd.read_sql_query(sql_games, conn)
-
-                # チーム順位
-                sql_ranking = "SELECT rank, team, point FROM team_ranking ORDER BY rank"
-                df_ranking = pd.read_sql_query(sql_ranking, conn)
-
-                # -------------------------------------------------
-                # ★ここが修正ポイント：Python側でテキストを整形する
-                # -------------------------------------------------
-                if df_games.empty:
-                    game_result_text = f"申し訳ありません。{target_display_date}の試合データが見つかりませんでした。"
-                else:
-                    # match_id ごとにデータを分割してテキスト化
-                    formatted_results = []
-                    # game_count(1回戦,2回戦)でグループ化
-                    for game_cnt, group_gc in df_games.groupby('game_count'):
-                        # さらに match_id(卓) でグループ化
-                        table_index = 1
-                        # match_idの出現順に処理
-                        for m_id, group_m in group_gc.groupby('match_id', sort=False):
-                            # 「第1回戦 (卓1)」のようなヘッダーを作る
-                            header = f"【第{game_cnt}回戦 - {table_index}卓目】"
-                            table_data = group_m[['rank', 'player', 'point']].to_string(index=False, header=['順位', '選手', 'Pt'])
-                            formatted_results.append(f"{header}\n{table_data}")
-                            table_index += 1
+                # =================================================
+                # パターンA: 個人ランキングを聞かれた場合
+                # =================================================
+                if "個人" in user_query and ("順位" in user_query or "ランキング" in user_query):
+                    # statsテーブルからポイント順に全選手を取得
+                    sql_stats = "SELECT player, team, points FROM stats ORDER BY points DESC"
+                    df_stats = pd.read_sql_query(sql_stats, conn)
                     
-                    game_result_text = f"【{target_display_date}の試合結果】\n\n" + "\n\n".join(formatted_results)
+                    if df_stats.empty:
+                        return {"reply": "個人成績データが見つかりませんでした。", "graph": None}
 
-                combined_data = f"{game_result_text}\n\n【現在のチーム順位】\n{df_ranking.to_string(index=False)}"
-                
-                final_prompt = f"""
-                あなたはMリーグの公式リポーターです。
-                質問「{user_query}」に対し、以下のデータを元に見やすく報告してください。
-                
-                【整形済みデータ】
-                {combined_data}
+                    # ランキング表を作成（テキスト整形）
+                    ranking_text = "【現在の個人ポイントランキング】\n"
+                    for i, row in df_stats.iterrows():
+                        # 順位に応じたアイコン
+                        rank = i + 1
+                        icon = "👑" if rank == 1 else "🥈" if rank == 2 else "🥉" if rank == 3 else "💀" if rank == len(df_stats) else f"{rank}位"
+                        
+                        # 30位くらいまで表示すると長いので、上位と下位をピックアップするか、
+                        # シンプルに全件リストとして返す（スクロールで見る前提）
+                        # ここでは見やすさ重視で全件出します
+                        ranking_text += f"{icon} {row['player']} ({row['team']}): {row['points']:+.1f}pt\n"
 
-                【重要】
-                1. 渡されたデータは**すでに卓ごとに「卓1」「卓2」と分割されています**。
-                2. AI側で勝手に行をまとめたり、順位を統合したり**しないでください**。
-                3. テキストにある「卓1」「卓2」という区切りをそのまま使って報告してください。
-                4. 順位に応じた絵文字(🥇,🥈,🥉,4️⃣)を使って彩ってください。
-                """
-                
-                res_final = openai.chat.completions.create(
-                    model="gpt-4o", messages=[{"role": "system", "content": final_prompt}], temperature=0.3
-                )
-                return {"reply": res_final.choices[0].message.content, "graph": None}
+                    return {"reply": ranking_text, "graph": None}
+
+                # =================================================
+                # パターンB: 試合結果・チーム順位（既存ロジック）
+                # =================================================
+                else:
+                    # 日付指定があるかチェック
+                    date_match = re.search(r'(\d{1,2})月(\d{1,2})日', user_query)
+                    
+                    df_games = pd.DataFrame()
+                    target_display_date = "直近"
+
+                    if date_match:
+                        month = int(date_match.group(1))
+                        day = int(date_match.group(2))
+                        target_date = f"2025/{month:02d}/{day:02d}"
+                        target_display_date = f"{month}月{day}日"
+
+                        # match_id順に取得
+                        sql_games = """
+                        SELECT match_id, date, game_count, rank, player, point 
+                        FROM games 
+                        WHERE date = ? 
+                        ORDER BY game_count ASC, match_id ASC, rank ASC
+                        """
+                        df_games = pd.read_sql_query(sql_games, conn, params=[target_date])
+                    
+                    else:
+                        # 日付指定がない場合
+                        sql_games = "SELECT match_id, date, game_count, rank, player, point FROM games ORDER BY date DESC, game_count DESC, rank ASC LIMIT 8"
+                        df_games = pd.read_sql_query(sql_games, conn)
+
+                    # チーム順位
+                    sql_ranking = "SELECT rank, team, point FROM team_ranking ORDER BY rank"
+                    df_ranking = pd.read_sql_query(sql_ranking, conn)
+
+                    # --- 試合結果の整形処理 ---
+                    if df_games.empty:
+                        game_result_text = f"申し訳ありません。{target_display_date}の試合データが見つかりませんでした。"
+                    else:
+                        formatted_results = []
+                        # 1.「第1回戦」「第2回戦」で分ける
+                        for game_cnt, group_gc in df_games.groupby('game_count'):
+                            # 2.「卓」で分ける
+                            sub_groups = [g for _, g in group_gc.groupby('match_id', sort=False)]
+                            
+                            # 安全装置: 4人区切り
+                            final_groups = []
+                            for sub_g in sub_groups:
+                                if len(sub_g) > 4:
+                                    for i in range(0, len(sub_g), 4):
+                                        final_groups.append(sub_g.iloc[i:i+4])
+                                else:
+                                    final_groups.append(sub_g)
+
+                            # 3. テキスト生成
+                            for idx, table_df in enumerate(final_groups):
+                                table_suffix = chr(65 + idx) # A, B...
+                                # 日付指定がない場合(直近)は日付も入れる
+                                date_str = f" ({table_df.iloc[0]['date'][5:]})" if not date_match else ""
+                                header = f"■ 第{game_cnt}回戦 ({table_suffix}卓){date_str}"
+                                
+                                rows_text = ""
+                                for _, row in table_df.iterrows():
+                                    rank_icon = ["🥇","🥈","🥉","4️⃣"][int(row['rank'])-1] if 1 <= int(row['rank']) <= 4 else ""
+                                    rows_text += f"{rank_icon} {int(row['rank'])}位: {row['player']} ({row['point']:+.1f}pt)\n"
+                                
+                                formatted_results.append(f"{header}\n{rows_text}")
+                        
+                        game_result_text = f"【{target_display_date}の試合結果】\n\n" + "\n".join(formatted_results)
+
+                    combined_data = f"{game_result_text}\n\n----------------\n【現在のチーム順位】\n{df_ranking.to_string(index=False)}"
+                    
+                    final_prompt = f"""
+                    あなたはMリーグの公式リポーターです。
+                    質問「{user_query}」に対し、以下の整形済みデータを**そのまま**表示してください。
+                    
+                    【データ】
+                    {combined_data}
+
+                    【指示】
+                    - データを要約したり、勝手にくっつけたりせず、渡されたテキストの形式を維持して回答してください。
+                    """
+                    
+                    res_final = openai.chat.completions.create(
+                        model="gpt-4o", messages=[{"role": "system", "content": final_prompt}], temperature=0
+                    )
+                    return {"reply": res_final.choices[0].message.content, "graph": None}
+
             except Exception as e:
+                print(f"Error: {e}")
                 return {"reply": f"データ取得エラー: {e}", "graph": None}
             finally:
                 conn.close()
