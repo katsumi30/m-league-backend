@@ -181,12 +181,12 @@ async def chat_endpoint(req: ChatRequest):
                 conn.close()
 
         # ---------------------------------------------------------
-        # 3. 最新結果・順位モード（日付指定 & 同時開催卓対応版）
+        # 3. 最新結果・順位モード（同日複数卓 強制分割版）
         # ---------------------------------------------------------
         elif "順位" in user_query or "ランキング" in user_query or "最新" in user_query or "試合結果" in user_query:
             conn = get_connection()
             try:
-                # 日付指定があるか正規表現でチェック
+                # 日付指定があるかチェック
                 date_match = re.search(r'(\d{1,2})月(\d{1,2})日', user_query)
                 
                 df_games = pd.DataFrame()
@@ -198,17 +198,17 @@ async def chat_endpoint(req: ChatRequest):
                     target_date = f"2025/{month:02d}/{day:02d}"
                     target_display_date = f"{month}月{day}日"
 
-                    # ★修正1: match_id を取得し、match_id ごとに固まるようにソート順を変更
+                    # match_id順に取得
                     sql_games = """
                     SELECT match_id, date, game_count, rank, player, point 
                     FROM games 
                     WHERE date = ? 
-                    ORDER BY game_count ASC, match_id, rank ASC
+                    ORDER BY game_count ASC, match_id ASC, rank ASC
                     """
                     df_games = pd.read_sql_query(sql_games, conn, params=[target_date])
                 
                 else:
-                    # 日付指定がない場合
+                    # 日付指定がない場合（直近）
                     sql_games = "SELECT match_id, date, game_count, rank, player, point FROM games ORDER BY date DESC, game_count DESC, rank ASC LIMIT 8"
                     df_games = pd.read_sql_query(sql_games, conn)
 
@@ -216,28 +216,42 @@ async def chat_endpoint(req: ChatRequest):
                 sql_ranking = "SELECT rank, team, point FROM team_ranking ORDER BY rank"
                 df_ranking = pd.read_sql_query(sql_ranking, conn)
 
+                # -------------------------------------------------
+                # ★ここが修正ポイント：Python側でテキストを整形する
+                # -------------------------------------------------
                 if df_games.empty:
                     game_result_text = f"申し訳ありません。{target_display_date}の試合データが見つかりませんでした。"
                 else:
-                    game_result_text = f"【{target_display_date}の試合結果】\n{df_games.to_string(index=False)}"
+                    # match_id ごとにデータを分割してテキスト化
+                    formatted_results = []
+                    # game_count(1回戦,2回戦)でグループ化
+                    for game_cnt, group_gc in df_games.groupby('game_count'):
+                        # さらに match_id(卓) でグループ化
+                        table_index = 1
+                        # match_idの出現順に処理
+                        for m_id, group_m in group_gc.groupby('match_id', sort=False):
+                            # 「第1回戦 (卓1)」のようなヘッダーを作る
+                            header = f"【第{game_cnt}回戦 - {table_index}卓目】"
+                            table_data = group_m[['rank', 'player', 'point']].to_string(index=False, header=['順位', '選手', 'Pt'])
+                            formatted_results.append(f"{header}\n{table_data}")
+                            table_index += 1
+                    
+                    game_result_text = f"【{target_display_date}の試合結果】\n\n" + "\n\n".join(formatted_results)
 
                 combined_data = f"{game_result_text}\n\n【現在のチーム順位】\n{df_ranking.to_string(index=False)}"
                 
-                # ★修正2: AIへの指示を強化（match_idを見てグループ分けさせる）
                 final_prompt = f"""
                 あなたはMリーグの公式リポーターです。
                 質問「{user_query}」に対し、以下のデータを元に見やすく報告してください。
                 
-                【データ】
+                【整形済みデータ】
                 {combined_data}
 
-                【重要：表示ルールの厳守】
-                1. **卓の分離**: データに `match_id` が含まれています。同じ「第1回戦」でも `match_id` が異なる行は、**別の会場で行われた別卓の試合**です。
-                   絶対に混ぜずに、「第1回戦 (A卓)」「第1回戦 (B卓)」のように**セクションを分けて**表示してください。
-                
-                2. それぞれの卓ごとに、1位から4位まで順位・選手名・ポイントを伝えてください。
-                3. 順位に応じた絵文字(🥇,🥈,🥉,4️⃣)を使ってください。
-                4. チーム順位は最後に簡潔に添えてください。
+                【重要】
+                1. 渡されたデータは**すでに卓ごとに「卓1」「卓2」と分割されています**。
+                2. AI側で勝手に行をまとめたり、順位を統合したり**しないでください**。
+                3. テキストにある「卓1」「卓2」という区切りをそのまま使って報告してください。
+                4. 順位に応じた絵文字(🥇,🥈,🥉,4️⃣)を使って彩ってください。
                 """
                 
                 res_final = openai.chat.completions.create(
