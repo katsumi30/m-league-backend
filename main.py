@@ -181,39 +181,41 @@ async def chat_endpoint(req: ChatRequest):
                 conn.close()
 
         # ---------------------------------------------------------
-        # 3. 最新結果・順位モード（日付指定対応版）
+        # 3. 最新結果・順位モード（日付指定 & 同時開催卓対応版）
         # ---------------------------------------------------------
         elif "順位" in user_query or "ランキング" in user_query or "最新" in user_query or "試合結果" in user_query:
             conn = get_connection()
             try:
-                # 日付指定があるか正規表現でチェック (例: 11月24日)
+                # 日付指定があるか正規表現でチェック
                 date_match = re.search(r'(\d{1,2})月(\d{1,2})日', user_query)
                 
                 df_games = pd.DataFrame()
                 target_display_date = "直近"
 
                 if date_match:
-                    # 日付指定がある場合
                     month = int(date_match.group(1))
                     day = int(date_match.group(2))
-                    # DBの形式(YYYY/MM/DD)に合わせる。一旦2025年固定にしています
                     target_date = f"2025/{month:02d}/{day:02d}"
                     target_display_date = f"{month}月{day}日"
 
-                    # その日付の試合だけを取得するSQL
-                    sql_games = "SELECT date, game_count, rank, player, point FROM games WHERE date = ? ORDER BY game_count ASC, rank ASC"
+                    # ★修正1: match_id を取得し、match_id ごとに固まるようにソート順を変更
+                    sql_games = """
+                    SELECT match_id, date, game_count, rank, player, point 
+                    FROM games 
+                    WHERE date = ? 
+                    ORDER BY game_count ASC, match_id, rank ASC
+                    """
                     df_games = pd.read_sql_query(sql_games, conn, params=[target_date])
                 
                 else:
-                    # 日付指定がない場合（これまで通りの動き）
-                    sql_games = "SELECT date, game_count, rank, player, point FROM games ORDER BY date DESC, game_count DESC, rank ASC LIMIT 8"
+                    # 日付指定がない場合
+                    sql_games = "SELECT match_id, date, game_count, rank, player, point FROM games ORDER BY date DESC, game_count DESC, rank ASC LIMIT 8"
                     df_games = pd.read_sql_query(sql_games, conn)
 
-                # チーム順位は常に最新を表示
+                # チーム順位
                 sql_ranking = "SELECT rank, team, point FROM team_ranking ORDER BY rank"
                 df_ranking = pd.read_sql_query(sql_ranking, conn)
 
-                # データが見つかったかどうかのチェック
                 if df_games.empty:
                     game_result_text = f"申し訳ありません。{target_display_date}の試合データが見つかりませんでした。"
                 else:
@@ -221,6 +223,7 @@ async def chat_endpoint(req: ChatRequest):
 
                 combined_data = f"{game_result_text}\n\n【現在のチーム順位】\n{df_ranking.to_string(index=False)}"
                 
+                # ★修正2: AIへの指示を強化（match_idを見てグループ分けさせる）
                 final_prompt = f"""
                 あなたはMリーグの公式リポーターです。
                 質問「{user_query}」に対し、以下のデータを元に見やすく報告してください。
@@ -229,10 +232,12 @@ async def chat_endpoint(req: ChatRequest):
                 {combined_data}
 
                 【重要：表示ルールの厳守】
-                1. 指定された日付のデータがあれば、その日の第1試合・第2試合の結果を詳しく伝えてください。
-                2. データがない場合は素直に「データがありません」と伝えてください。
-                3. 順位に応じた絵文字(🥇,🥈,🥉,4️⃣,🏆)を使ってください。
-                4. チーム順位は簡潔に添えてください。
+                1. **卓の分離**: データに `match_id` が含まれています。同じ「第1回戦」でも `match_id` が異なる行は、**別の会場で行われた別卓の試合**です。
+                   絶対に混ぜずに、「第1回戦 (A卓)」「第1回戦 (B卓)」のように**セクションを分けて**表示してください。
+                
+                2. それぞれの卓ごとに、1位から4位まで順位・選手名・ポイントを伝えてください。
+                3. 順位に応じた絵文字(🥇,🥈,🥉,4️⃣)を使ってください。
+                4. チーム順位は最後に簡潔に添えてください。
                 """
                 
                 res_final = openai.chat.completions.create(
